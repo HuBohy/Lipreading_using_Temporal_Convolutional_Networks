@@ -28,7 +28,7 @@ def get_preprocessing_pipelines(modality):
     elif modality == 'raw_audio':
 
         preprocessing['train'] = Compose([
-                                    AddNoise( noise=np.load('/mnt/c/Users/bohyh/Documents/GITHUB/SnLDetection/Lipreading_using_Temporal_Convolutional_Networks/data/babbleNoise_resample_16K.npy')),
+                                    AddNoise( noise=np.load('/mnt/c/Users/bohyh/Documents/GITHUB/SnLDetection-ACII22/LR_TCN/data/babbleNoise_resample_16K.npy')),
                                     NormalizeUtterance()])
 
         preprocessing['val'] = NormalizeUtterance()
@@ -50,6 +50,7 @@ def get_data_loaders(args, modality = None, data_dir = None, batch_sampler = Non
         if partition not in tmp:
             tmp.append(partition)
     partition_list = tmp
+    # print(args.annonation_direc)
     # create dataset object for each partitio
     dsets = {partition: MyDataset(
                 modality=modality,
@@ -61,6 +62,7 @@ def get_data_loaders(args, modality = None, data_dir = None, batch_sampler = Non
                 data_suffix='.npz'
                 ) for partition in partition_list}
     if batch_sampler is None:
+        # print(dsets['test'].labels_count)
         class_sample_count = {x: list(dsets[x].labels_count.values()) for x in partition_list}
         weights_per_label = {x: 1 / torch.Tensor(class_sample_count[x]) for x in partition_list}
         weights = {x: [weights_per_label[x][y[1]] for y in dsets[x].list.values()] for x in partition_list}

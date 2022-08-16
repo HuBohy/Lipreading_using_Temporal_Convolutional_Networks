@@ -17,6 +17,9 @@ import argparse
 import optunity
 import optunity.metrics
 import numpy as np
+
+import fairseq
+
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from sklearn.decomposition import PCA
@@ -36,6 +39,8 @@ from lipreading.model import Lipreading
 from lipreading.mixup import mixup_data, mixup_criterion
 from lipreading.optim_utils import get_optimizer, CosineScheduler
 from lipreading.dataloaders import get_data_loaders, get_preprocessing_pipelines
+
+from lipreading.fusion import FusionNet
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -102,21 +107,15 @@ np.random.seed(1)
 random.seed(1)
 torch.backends.cudnn.benchmark = True
 
-class FusionNet(nn.Module):
-    def __init__(self, input_size = 1536, n_classes = 3) -> None:
-        super(FusionNet, self).__init__()
+args_loaded = load_json( args.config_path)
+tcn_options = { 'num_layers': args_loaded['tcn_num_layers'],
+                    'kernel_size': args_loaded['tcn_kernel_size'],
+                    'dropout': args_loaded['tcn_dropout'],
+                    'dwpw': args_loaded['tcn_dwpw'],
+                    'width_mult': args_loaded['tcn_width_mult'],
+                  }
 
-        self.dropout = nn.Dropout(0.5)
 
-        self.fc1 = nn.Linear(input_size, 1024)
-        self.fc4 = nn.Linear(1024, n_classes)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.fc4(x)
-        return x
 
 class Fusion():
     def __init__(self, args, models_path, is_SVM=True, logger=None) -> None:
@@ -140,7 +139,15 @@ class Fusion():
         for modality in self.modalities:
             self._load_data_dirs(modality)
             self._load_dsets(args, modality)
-            self._load_feats_models(modality, models_path[modality])
+            if modality == 'video':
+                self._load_feats_models(modality, models_path[modality])
+            else:
+                self._load_feats_models(modality, models_path[modality])
+                
+                # cp_path = "mnt/c/Users/bohyh/Documents/GITHUB/Thesis/wav2vec_small.pt"
+                # model, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task([cp_path])
+                # feature_extractor = model[0].feature_extractor.cuda()
+                # self.feat_models.append(feature_extractor)
 
         for model in self.feat_models:
             model.eval()
@@ -154,6 +161,7 @@ class Fusion():
         self.dset_loaders.append(ds_ldr)
         if self.sampler is None:
             self.sampler = splr
+        print(self.sampler.keys())
 
     def _load_feats_models(self, modality, model_path):
         base_model = get_model_from_json(modality, fusion=True)
@@ -163,7 +171,7 @@ class Fusion():
         if self.is_SVM:
             self.fusion_model = None
         else:
-            self.fusion_model = FusionNet().cuda()
+            self.fusion_model = FusionNet(tcn_options=tcn_options).cuda()
 
     def _load_model_parameters(self):
         self.optimizer = self.init_optimizer
@@ -268,9 +276,10 @@ class Fusion():
                     preds = torch.Tensor(self.fusion_model.predict(pca_logits)).cuda()
                     running_corrects += preds.eq(labels.cuda().view_as(preds)).sum().item()
                 else:
-                    logits = self.fusion_model(cat_logits.cuda())
-                    _, preds = torch.max(F.softmax(logits, dim=1), dim=1)
-                    running_corrects += preds.eq(labels.cuda().view_as(preds)).sum().item()
+                    logits = self.fusion_model(cat_logits.unsqueeze(1).cuda())
+                    print(logits.shape)
+                    _, preds = torch.max(F.softmax(logits, dim=-1), dim=-1)
+                    running_corrects += preds.eq(F.one_hot(labels, num_classes=3).float().cuda()).sum().item()
                     loss = self.criterion(logits.squeeze(1), F.one_hot(labels, num_classes=3).float().cuda())
                     running_loss += loss.item() * input.size(0)
 
@@ -473,6 +482,7 @@ def fusion(args, logger, ckpt_saver, models_path, is_SVM = False, full_finetune=
     epoch = args.init_epoch
     
     if args.test:
+        print(fusion_obj.sampler.keys())
         parti = 'test' if 'test' in list(fusion_obj.sampler.keys()) else 'train'
         if is_SVM:
             fusion_model_path = f"{os.path.join(*args.data_dir.split('/')[:-1])}/SVM_model.sav"
@@ -542,8 +552,8 @@ def fusion(args, logger, ckpt_saver, models_path, is_SVM = False, full_finetune=
 def main():
 
     # models_path = {'video': 'train_logs/tcn/fullndc_video_model_realfinetuned/ckpt.best.pth.tar', 'raw_audio': 'train_logs/tcn/fullndc_audio_model_realfinetuned/ckpt.best.pth.tar'}
-    # models_path = {'video': 'train_logs/tcn/fullndc_video_model_scratch/ckpt.best.pth.tar', 'raw_audio': 'train_logs/tcn/fullndc_audio_model_scratch/ckpt.best.pth.tar'}
-    models_path = {'video': 'train_logs/tcn/fullndc_video_model_finetuned/ckpt.best.pth.tar', 'raw_audio': 'train_logs/tcn/fullndc_audio_model_finetuned/ckpt.best.pth.tar'}
+    # models_path = {'video': '../train_logs/tcn/fullndc_video_model_scratch/ckpt.best.pth.tar', 'raw_audio': '../train_logs/tcn/fullndc_audio_model_scratch/ckpt.best.pth.tar'}
+    models_path = {'video': '../train_logs/tcn/fullndc_video_model_fullfinetuned/ckpt.best.pth.tar', 'raw_audio': '../train_logs/tcn/fullndc_audio_model_lastfinetuned/ckpt.best.pth.tar'}
     # -- logging
     save_path = get_save_folder( args)
     print("Model and log being saved in: {}".format(save_path))
