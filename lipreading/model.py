@@ -2,10 +2,13 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
+import os
 from lipreading.models.resnet import ResNet, BasicBlock
 from lipreading.models.resnet1D import ResNet1D, BasicBlock1D
 from lipreading.models.shufflenetv2 import ShuffleNetV2
 from lipreading.models.tcn import MultibranchTemporalConvNet, TemporalConvNet
+
+from lipreading.utils import load_json, calculateNorm2
 
 #test
 
@@ -18,6 +21,33 @@ def threeD_to_2D_tensor(x):
 
 def _average_batch(x, lengths, B):
     return torch.stack( [torch.mean( x[index][:,0:i], 1 ) for index, i in enumerate(lengths)],0 )
+
+def get_model_from_json(modality = None, fusion=False, args=None):
+    assert args.config_path.endswith('.json') and os.path.isfile(args.config_path), \
+        "'.json' config path does not exist. Path input: {}".format(args.config_path)
+    args_loaded = load_json( args.config_path)
+    args.backbone_type = args_loaded['backbone_type']
+    args.width_mult = args_loaded['width_mult']
+    args.relu_type = args_loaded['relu_type']
+    tcn_options = { 'num_layers': args_loaded['tcn_num_layers'],
+                    'kernel_size': args_loaded['tcn_kernel_size'],
+                    'dropout': args_loaded['tcn_dropout'],
+                    'dwpw': args_loaded['tcn_dwpw'],
+                    'width_mult': args_loaded['tcn_width_mult'],
+                  }
+    if modality is None:
+        modality = args.modality
+
+    model = Lipreading( modality=modality,
+                        num_classes=args.num_classes,
+                        tcn_options=tcn_options,
+                        backbone_type=args.backbone_type,
+                        relu_type=args.relu_type,
+                        width_mult=args.width_mult,
+                        extract_feats=args.extract_feats,
+                        fusion=fusion).cuda()
+    calculateNorm2(model)
+    return model
 
 
 class MultiscaleMultibranchTCN(nn.Module):

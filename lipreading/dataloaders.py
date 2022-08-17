@@ -38,20 +38,19 @@ def get_preprocessing_pipelines(modality):
     return preprocessing
 
 
-def get_data_loaders(args, modality = None, data_dir = None, batch_sampler = None):
+def get_data_loaders(args, modality = None, data_dir = None, batch_sampler = None, partitions = ['train', 'val', 'test']):
     if modality is None:
         modality = args.modality
     if data_dir is None:
         data_dir = args.data_dir
     preprocessing = get_preprocessing_pipelines(modality)
-    partition_list = [os.path.basename(f) for f in glob(os.path.join(data_dir, '**', '*'), recursive=True) if os.path.basename(f) in ['train', 'val', 'test']]
+    partition_list = [os.path.basename(f) for f in glob(os.path.join(data_dir, '**', '*'), recursive=True) if os.path.basename(f) in partitions]
     tmp = []
     for partition in partition_list:
         if partition not in tmp:
             tmp.append(partition)
     partition_list = tmp
-    # print(args.annonation_direc)
-    # create dataset object for each partitio
+    # create dataset object for each partition
     dsets = {partition: MyDataset(
                 modality=modality,
                 data_partition=partition,
