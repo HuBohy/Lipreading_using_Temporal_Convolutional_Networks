@@ -158,6 +158,7 @@ def evaluate(model, dset_loader, criterion, logger=None, feat_models= None):
             all_logits = np.zeros((len(dset_loader)*args.batch_size, args.num_classes))
             all_alpha = np.zeros(len(dset_loader)*args.batch_size)
             dataset = dset_loader.dataset
+
         for batch_idx, ds_ldrs in enumerate(tqdm(dset_loader)):
             if feat_models is not None:
                 cat_logits = torch.Tensor().cuda()
@@ -209,8 +210,7 @@ def evaluate(model, dset_loader, criterion, logger=None, feat_models= None):
     print('{} in total\tCR: {}'.format( len(dataset), running_corrects/len(dataset)))
     return running_corrects/len(dataset), running_loss/len(dataset)
 
-
-def train(model, dset_loader, criterion, epoch, optimizer, logger):
+def train(model, dset_loader, criterion, epoch, optimizer, logger, feat_models=None, full_finetune=False):
     data_time = AverageMeter()
     batch_time = AverageMeter()
 
@@ -220,22 +220,44 @@ def train(model, dset_loader, criterion, epoch, optimizer, logger):
     logger.info('Epoch {}/{}'.format(epoch, args.epochs - 1))
     logger.info('Current learning rate: {}'.format(lr))
 
+    if full_finetune and epoch == 0:
+        for fmodel in feat_models:
+            fmodel.train()
+
     model.train()
     running_loss = 0.
     running_corrects = 0.
     running_all = 0.
     end = time.time()
-    for batch_idx, (input, lengths, labels, _) in enumerate(dset_loader):
+
+    if type(dset_loader) == dict:
+        ds_logger = list(dset_loader.values())[0]
+        dset_loader = zip(*dset_loader.values())
+    else:
+        ds_logger = dset_loader
+
+    for batch_idx, ds_ldrs in enumerate(tqdm(dset_loader)):
         # measure data loading time
         data_time.update(time.time() - end)
 
         # --
+        if feat_models is not None:
+            cat_logits = torch.Tensor().cuda()
+            for i, ds in enumerate(ds_ldrs):
+                input, lengths, labels, _ = ds
+                feat_logits = (feat_models[i](input.unsqueeze(1).cuda(), lengths=lengths))
+                cat_logits = torch.cat((cat_logits, feat_logits), dim=-1)
+            input = cat_logits
+            # labels = F.one_hot(labels, num_classes=self.args.num_classes).float().cuda()
+        else:
+            input, lengths, labels, _ = ds_ldrs
+
         input, labels_a, labels_b, lam = mixup_data(input, labels, args.alpha)
         labels_a, labels_b = labels_a.cuda(), labels_b.cuda()
 
         optimizer.zero_grad()
         
-        logits = model(input.unsqueeze(1).cuda(), lengths=lengths) # output shape = [batch_size, n_classes]
+        logits = model(input.unsqueeze(1).cuda(), lengths=lengths).view((args.batch_size, args.num_classes)) # output shape = [batch_size, n_classes]
 
         loss_func = mixup_criterion(labels_a, labels_b, lam)
         loss = loss_func(criterion, logits)
@@ -246,13 +268,13 @@ def train(model, dset_loader, criterion, epoch, optimizer, logger):
         batch_time.update(time.time() - end)
         end = time.time()
         # -- compute running performance
-        _, predicted = torch.max(F.softmax(logits, dim=1).data, dim=1)
+        _, predicted = torch.max(F.softmax(logits, dim=-1).data, dim=-1)
         running_loss += loss.item()*input.size(0)
         running_corrects += lam * predicted.eq(labels_a.view_as(predicted)).sum().item() + (1 - lam) * predicted.eq(labels_b.view_as(predicted)).sum().item()
         running_all += input.size(0)
         # -- log intermediate results
-        if batch_idx % args.interval == 0 or (batch_idx == len(dset_loader)-1):
-            update_logger_batch( args, logger, dset_loader, batch_idx, running_loss, running_corrects, running_all, batch_time, data_time )
+        if batch_idx % args.interval == 0 or (batch_idx == len(ds_logger)-1):
+            update_logger_batch( args, logger, ds_logger, batch_idx, running_loss, running_corrects, running_all, batch_time, data_time )
 
     return model
 
@@ -277,7 +299,7 @@ def fusion(args, logger, ckpt_saver, models_path, full_finetune=True):
 
     epoch = args.init_epoch
     while epoch < args.epochs:
-        fusion_obj.train()
+        fusion_obj.train() # TODO: adapt train func to match LR_TCN train
         acc_avg_val, loss_avg_val = fusion_obj.evaluate('val')
         logger.info('{} Epoch:\t{:2}\tLoss val: {:.4f}\tAcc val:{:.4f}, LR: {}'.format('val', epoch, loss_avg_val, acc_avg_val, showLR(fusion_obj.optimizer)))
         
@@ -331,13 +353,11 @@ def main():
     if args.modality == 'fusion':
         fusion_obj = Fusion(args, models_path, logger, tcn_options)
 
+        model = fusion_obj.fusion_model
         # -- get dataset iterators
-        dset_loaders, _ = fusion_obj.get_data_loaders(args)
+        dset_loaders = fusion_obj.get_data_loaders()
 
-        feat_models = fusion_obj.feat_models
-        print(len(feat_models))
-    #     fusion(args, logger, ckpt_saver, models_path)
-    #     return
+        feat_models = fusion_obj.get_feat_models()
     
     else:
         # -- get model
@@ -345,13 +365,13 @@ def main():
         # -- get dataset iterators
         dset_loaders, _ = get_data_loaders(args)
         feat_models = None
-        # -- get optimizer
-        optimizer = get_optimizer(args.optimizer, optim_policies=model.parameters(), lr=args.lr)
     
     # -- get loss function
     criterion = nn.CrossEntropyLoss()
     # -- get learning rate scheduler
     scheduler = CosineScheduler(args.lr, args.epochs)
+    # -- get optimizer
+    optimizer = get_optimizer(args.optimizer, optim_policies=model.parameters(), lr=args.lr)
 
     if args.model_path:
         assert args.model_path.endswith('.tar') and os.path.isfile(args.model_path), \
@@ -387,8 +407,8 @@ def main():
 
     epoch = args.init_epoch
     while epoch < args.epochs:
-        model = train(model, dset_loaders['train'], criterion, epoch, optimizer, logger)
-        acc_avg_val, loss_avg_val = evaluate(model, dset_loaders['val'], criterion, logger=logger)
+        model = train(model, dset_loaders['train'], criterion, epoch, optimizer, logger, feat_models)
+        acc_avg_val, loss_avg_val = evaluate(model, dset_loaders['val'], criterion, logger=logger, feat_models=feat_models)
         logger.info('{} Epoch:\t{:2}\tLoss val: {:.4f}\tAcc val:{:.4f}, LR: {}'.format('val', epoch, loss_avg_val, acc_avg_val, showLR(optimizer)))
         # -- save checkpoint
         save_dict = {

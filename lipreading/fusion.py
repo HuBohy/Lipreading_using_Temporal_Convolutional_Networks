@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import os
 import numpy as np
 import optunity.metrics
+import time
 
 from tqdm import tqdm
 from sklearn.decomposition import PCA
@@ -12,7 +13,7 @@ from sklearn.metrics import confusion_matrix
 from lipreading.model import MultiscaleMultibranchTCN, get_model_from_json
 from lipreading.mixup import mixup_data, mixup_criterion
 from lipreading.dataloaders import get_data_loaders
-from lipreading.utils import load_model
+from lipreading.utils import load_model, AverageMeter, showLR, update_logger_batch
 from lipreading.optim_utils import get_optimizer, CosineScheduler
 
 class FusionNet(nn.Module):
@@ -37,7 +38,7 @@ class FusionNet(nn.Module):
 
         # self.tcn_output = nn.Linear(num_channels[-1], num_classes)
 
-    def forward(self, x):
+    def forward(self, x, lengths=None):
         x = self.fc1(x)
         x = F.relu(x)
         x = self.dropout(x)
@@ -45,7 +46,6 @@ class FusionNet(nn.Module):
         return x
 
         # B = x.size()[0]
-        # lengths = [y.size()[-1] for y in x]
         # return self.tcn_output(self.tcn1(x, lengths, B))
 
 class Fusion():
@@ -100,56 +100,93 @@ class Fusion():
         if self.sampler is None:
             self.sampler = splr
 
-    def get_data_loaders(self, args=None):
-        return self.dset_loaders, None
-
     def _load_feats_models(self, modality, model_path):
         base_model = get_model_from_json(modality, fusion=True, args=self.args)
         self.feat_models.append(load_model(model_path, base_model, allow_size_mismatch=True).cuda())
 
-    def _load_model_parameters(self):
-        self.optimizer = self.init_optimizer
-        self.lr = self.args.lr
-        # -- get loss function
-        self.criterion = nn.CrossEntropyLoss()
-        # -- get optimizer
-        self.optimizer = get_optimizer(self.optimizer, optim_policies=self.fusion_model.parameters(), lr=self.lr)
-        # -- get learning rate scheduler
-        self.scheduler = CosineScheduler(self.lr, self.epochs)
+    def get_data_loaders(self):
+        return self.dset_loaders
 
-    def _train_DNN(self):
-        self.fusion_model.train()
-        for batch_idx, (ds1, ds2) in enumerate(tqdm(zip(self.dset_loaders['train']['video'], self.dset_loaders['train']['raw_audio']))):
-            input, lengths, labels, _ = ds1
-            logits1 = self.feat_models[0](input.unsqueeze(1).cuda(), lengths=lengths)
-            input, lengths, _, _ = ds2
-            logits2 = self.feat_models[1](input.unsqueeze(1).cuda(), lengths=lengths)
-            cat_logits = torch.cat((logits1, logits2), dim=-1)
+    def get_feat_models(self):
+        return self.feat_models
 
-            input, labels_a, labels_b, lam = mixup_data(cat_logits, F.one_hot(labels, num_classes=3).float().cuda(), self.args.alpha)
-            labels_a, labels_b = labels_a.cuda(), labels_b.cuda()
+    # def _load_model_parameters(self):
+    #     self.optimizer = self.init_optimizer
+    #     self.lr = self.args.lr
+    #     # -- get loss function
+    #     self.criterion = nn.CrossEntropyLoss()
+    #     # -- get optimizer
+    #     self.optimizer = get_optimizer(self.optimizer, optim_policies=self.fusion_model.parameters(), lr=self.lr)
+    #     # -- get learning rate scheduler
+    #     self.scheduler = CosineScheduler(self.lr, self.epochs)
 
-            self.optimizer.zero_grad()
-            logits = self.fusion_model(cat_logits.unsqueeze(1).cuda())
+    # def train(self, model, dset_loader, criterion, epoch, optimizer, logger, feat_models=None, full_finetune=False):
+    #     data_time = AverageMeter()
+    #     batch_time = AverageMeter()
 
-            loss_func = mixup_criterion(labels_a, labels_b, lam)
-            loss = loss_func(self.criterion, logits.squeeze(1))
+    #     lr = showLR(optimizer)
+        
+    #     logger.info('-' * 10)
+    #     logger.info('Epoch {}/{}'.format(epoch, self.args.epochs - 1))
+    #     logger.info('Current learning rate: {}'.format(lr))
 
-            loss.backward()
-            self.optimizer.step()
+    #     if full_finetune and epoch == 0:
+    #         for fmodel in feat_models:
+    #             fmodel.train()
+        
+    #     model.train()
+    #     running_loss = 0.
+    #     running_corrects = 0.
+    #     running_all = 0.
+    #     end = time.time()
 
-    def train_full_finetune(self, epoch):
-        self.logits = torch.Tensor()
-        if epoch == 0:
-            for model in self.feat_models:
-                model.train()
+    #     if type(dset_loader) == dict:
+    #         ds_logger = list(dset_loader.values())[0]
+    #         dset_loader = zip(*dset_loader.values())
+    #     else:
+    #         ds_logger = dset_loader
 
-        self._train_DNN()
+    #     for batch_idx, ds_ldrs in enumerate(tqdm(dset_loader)):
+    #         # measure data loading time
+    #         data_time.update(time.time() - end)
 
-    def train(self):
-        self.logits = torch.Tensor()
-        self._train_DNN()
-            
+    #         # --
+    #         if feat_models is not None:
+    #             cat_logits = torch.Tensor().cuda()
+    #             for i, ds in enumerate(ds_ldrs):
+    #                 input, lengths, labels, _ = ds
+    #                 feat_logits = (feat_models[i](input.unsqueeze(1).cuda(), lengths=lengths))
+    #                 cat_logits = torch.cat((cat_logits, feat_logits), dim=-1)
+    #             input = cat_logits
+    #             # labels = F.one_hot(labels, num_classes=self.args.num_classes).float().cuda()
+    #         else:
+    #             input, lengths, labels, _ = ds_ldrs
+
+    #         input, labels_a, labels_b, lam = mixup_data(input, labels, self.args.alpha)
+    #         labels_a, labels_b = labels_a.cuda(), labels_b.cuda()
+
+    #         optimizer.zero_grad()
+
+    #         logits = model(input.unsqueeze(1).cuda(), lengths=lengths).view((self.args.batch_size, self.args.num_classes)) # output shape = [batch_size, n_classes]
+
+    #         loss_func = mixup_criterion(labels_a, labels_b, lam)
+    #         loss = loss_func(self.criterion, logits)
+
+    #         loss.backward()
+    #         optimizer.step()
+    #         # measure elapsed time
+    #         batch_time.update(time.time() - end)
+    #         end = time.time()
+    #         # -- compute running performance
+    #         _, predicted = torch.max(F.softmax(logits, dim=-1).data, dim=-1)
+    #         running_loss += loss.item()*input.size(0)
+    #         running_corrects += lam * predicted.eq(labels_a.view_as(predicted)).sum().item() + (1 - lam) * predicted.eq(labels_b.view_as(predicted)).sum().item()
+    #         running_all += input.size(0)
+    #         # -- log intermediate results
+    #         if batch_idx % self.args.interval == 0 or (batch_idx == len(ds_logger)-1 ):
+    #             update_logger_batch( self.args, logger, ds_logger, batch_idx, running_loss, running_corrects, running_all, batch_time, data_time )
+        
+    #     return model
 
     # def evaluate(self, model, dset_loaders, criterion= None, logger=None):
     #     intens_lst = ['0low', '0medium', '0high', '1subtle', '1low', '1medium', '1high', '2none']
